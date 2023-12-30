@@ -1,0 +1,247 @@
+Resources:
+  myVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      Tags:
+        - Key: env
+          Value: prod
+
+  igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: env
+          Value: prod
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref myVPC
+      InternetGatewayId: !Ref igw  
+  
+  publicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref myVPC
+      Tags:
+        - Key: env
+          Value: prod
+
+  publicRoute:
+    Type: AWS::EC2::Route
+    Properties:      
+      RouteTableId: !Ref publicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref igw  
+
+  publicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: us-east-2a
+      VpcId: !Ref myVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: env
+          Value: prod      
+
+  publicRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref publicSubnet
+      RouteTableId: !Ref publicRouteTable
+
+  eip:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+   Type: AWS::EC2::NatGateway
+   Properties:
+      AllocationId: !GetAtt eip.AllocationId
+      SubnetId: !Ref publicSubnet
+      Tags:
+      - Key: env
+        Value: production
+  
+  privateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref myVPC
+      Tags:
+        - Key: env
+          Value: prod
+  
+  privateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref privateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+  
+  privateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: us-east-2b
+      VpcId: !Ref myVPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: env
+          Value: prod      
+  
+  privateRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref privateSubnet
+      RouteTableId: !Ref privateRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId: !Ref myVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  jumpHostInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: AttachGateway
+    Properties:
+      KeyName: "my-vpc-key"      
+      ImageId: ami-05fb0b8c1424f266b
+      InstanceType: t2.micro 
+      NetworkInterfaces: 
+      - AssociatePublicIpAddress: "true"
+        DeviceIndex: "0"
+        GroupSet: 
+          - Ref: "InstanceSecurityGroup"
+        SubnetId: 
+          Ref: "publicSubnet"
+
+  privateInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: AttachGateway
+    Properties:
+      KeyName: "my-vpc-key"      
+      ImageId: ami-05fb0b8c1424f266b
+      InstanceType: t2.micro 
+      NetworkInterfaces: 
+      - AssociatePublicIpAddress: "false"
+        DeviceIndex: "0"
+        GroupSet: 
+          - Ref: "InstanceSecurityGroup"
+        SubnetId: 
+          Ref: "privateSubnet"
+      Tenancy: default
+      UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            cd /tmp
+            apt update -y
+            apt install -y httpd24
+            echo "Healthy Hello HI" > /var/www/html/index.html
+            service httpd start
+            /opt/aws/bin/cfn-signal \
+              -e $? \
+              --stack ${AWS::StackName} \
+              --resource privateInstance \
+              --region ${AWS::Region}
+  
+  EC2TargetGroup:
+      Type: AWS::ElasticLoadBalancingV2::TargetGroup
+      Properties:
+        HealthCheckIntervalSeconds: 30
+        HealthCheckProtocol: HTTP
+        HealthCheckTimeoutSeconds: 15
+        HealthyThresholdCount: 5
+        Matcher:
+          HttpCode: '200'
+        Name: EC2TargetGroup
+        Port: 80
+        Protocol: HTTP
+        TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'
+        Targets:
+        - Id:
+            Ref: privateInstance
+          Port: 80
+        UnhealthyThresholdCount: 3
+        VpcId:
+          Ref: 'myVPC'
+        Tags:
+        - Key: Name
+          Value: EC2TargetGroup
+        - Key: Port
+          Value: 80
+
+    #ELB (ALB)
+  ALBListener:
+      Type: AWS::ElasticLoadBalancingV2::Listener
+      Properties:
+        DefaultActions:
+          - Type: forward
+            TargetGroupArn:
+              Ref: EC2TargetGroup
+        LoadBalancerArn:
+            Ref: ApplicationLoadBalancer
+        Port: 80
+        Protocol: HTTP
+
+  ApplicationLoadBalancer:
+      Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+      Properties:
+        Scheme: internet-facing # or internal
+        Subnets:
+        - Ref: publicSubnet
+        - Ref: privateSubnet
+        SecurityGroups:
+        - Ref: InstanceSecurityGroup
+
+Outputs:
+
+    VPC:
+        Description: 'Virtual Private Cloud'
+        Value:
+          Ref: 'myVPC'
+    ALBHostName:
+        Description: 'Application Load Balancer Hostname'
+        Value:
+          !GetAtt ApplicationLoadBalancer.DNSName
+    EC2Instance:
+        Description: 'EC2 Instance'
+        Value:
+          Ref: privateInstance
+    EC2TargetGroup:
+        Description: 'EC2 Target Group'
+        Value:
+          Ref: EC2TargetGroup
+    ApplicationLoadBalancer:
+        Description: 'Application Load Balancer'
+        Value:
+          Ref: ApplicationLoadBalancer
+
+      
+      
+      
+      
+      
+      
+  
